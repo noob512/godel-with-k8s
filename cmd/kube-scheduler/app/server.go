@@ -65,7 +65,7 @@ type Option func(runtime.Registry) error
 // NewSchedulerCommand creates a *cobra.Command object with default parameters and registryOptions
 func NewSchedulerCommand(registryOptions ...Option) *cobra.Command {
 	opts := options.NewOptions()
-	klog.Info("hello")
+	klog.Info("hello 小修改")
 	cmd := &cobra.Command{
 		Use: "kube-scheduler",
 		Long: `The Kubernetes scheduler is a control plane process which assigns
