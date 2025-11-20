@@ -1,0 +1,18 @@
+I1120 11:36:04.100307       1 server.go:68] hello 小修改
+I1120 11:36:04.100499       1 server.go:94] CHANGE
+I1120 11:36:04.399285       1 serving.go:347] Generated self-signed cert in-memory
+W1120 11:36:04.689900       1 client_config.go:615] Neither --kubeconfig nor --master was specified.  Using the inClusterConfig.  This might not work.
+W1120 11:36:04.709840       1 authorization.go:47] Authorization is disabled
+W1120 11:36:04.709861       1 authentication.go:47] Authentication is disabled
+I1120 11:36:04.709882       1 deprecated_insecure_serving.go:54] Serving healthz insecurely on [::]:10251
+I1120 11:36:04.714721       1 secure_serving.go:200] Serving securely on [::]:10259
+I1120 11:36:04.714857       1 requestheader_controller.go:169] Starting RequestHeaderAuthRequestController
+I1120 11:36:04.714881       1 shared_informer.go:240] Waiting for caches to sync for RequestHeaderAuthRequestController
+I1120 11:36:04.714943       1 tlsconfig.go:240] "Starting DynamicServingCertificateController"
+I1120 11:36:04.721860       1 configmap_cafile_content.go:201] "Starting controller" name="client-ca::kube-system::extension-apiserver-authentication::client-ca-file"
+I1120 11:36:04.721895       1 shared_informer.go:240] Waiting for caches to sync for client-ca::kube-system::extension-apiserver-authentication::client-ca-file
+I1120 11:36:04.721946       1 configmap_cafile_content.go:201] "Starting controller" name="client-ca::kube-system::extension-apiserver-authentication::requestheader-client-ca-file"
+I1120 11:36:04.721957       1 shared_informer.go:240] Waiting for caches to sync for client-ca::kube-system::extension-apiserver-authentication::requestheader-client-ca-file
+I1120 11:36:04.815132       1 shared_informer.go:247] Caches are synced for RequestHeaderAuthRequestController 
+I1120 11:36:04.822131       1 shared_informer.go:247] Caches are synced for client-ca::kube-system::extension-apiserver-authentication::requestheader-client-ca-file 
+I1120 11:36:04.822230       1 shared_informer.go:247] Caches are synced for client-ca::kube-system::extension-apiserver-authentication::client-ca-file 
