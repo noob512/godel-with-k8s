@@ -216,89 +216,121 @@ var defaultSchedulerOptions = schedulerOptions{
 	applyDefaultProfile: true,
 }
 
-// New returns a Scheduler
+// New 返回一个新的调度器实例。
+// 该函数负责初始化调度器的核心组件，包括缓存、插件注册表、配置器，并根据配置创建调度器对象。
+//
+// 参数:
+// - client: 用于与 Kubernetes API 服务器通信的客户端接口。
+// - informerFactory: 共享的 Informer 工厂，用于监听和缓存 API 对象。
+// - recorderFactory: 用于创建事件记录器的工厂，用于向 API 服务器发送事件。
+// - stopCh: 一个只读的通道，用于接收停止调度器的信号。
+// - opts: 可选的配置选项，用于自定义调度器行为。
+//
+// 返回:
+// - *Scheduler: 创建好的调度器实例。
+// - error: 如果在创建过程中发生任何错误，则返回错误。
 func New(client clientset.Interface,
 	informerFactory informers.SharedInformerFactory,
 	recorderFactory profile.RecorderFactory,
 	stopCh <-chan struct{},
 	opts ...Option) (*Scheduler, error) {
 
+	// 如果 stopCh 为 nil，则使用一个永远不会关闭的通道 wait.NeverStop。
 	stopEverything := stopCh
 	if stopEverything == nil {
 		stopEverything = wait.NeverStop
 	}
 
+	// 从默认调度器选项开始，并应用所有传入的选项来覆盖默认值。
 	options := defaultSchedulerOptions
 	for _, opt := range opts {
 		opt(&options)
 	}
 
+	// 如果需要应用默认配置文件，则从 Scheme 的默认值创建配置文件。
 	if options.applyDefaultProfile {
+		klog.Info("应用默认配置文件")
 		var versionedCfg v1beta2.KubeSchedulerConfiguration
-		scheme.Scheme.Default(&versionedCfg)
+		scheme.Scheme.Default(&versionedCfg) // 对版本化的配置对象设置默认值。
 		cfg := config.KubeSchedulerConfiguration{}
+		// 将版本化的配置对象转换为内部版本。
 		if err := scheme.Scheme.Convert(&versionedCfg, &cfg, nil); err != nil {
 			return nil, err
 		}
+		// 使用转换后的配置文件。
 		options.profiles = cfg.Profiles
 	}
+
+	// 创建调度器内部缓存，用于存储 Pod、Node 等信息。
+	// durationToExpireAssumedPod 是假设 Pod 的过期时间。
 	schedulerCache := internalcache.New(durationToExpireAssumedPod, stopEverything)
 
+	// 创建内置（树内）插件的注册表。
 	registry := frameworkplugins.NewInTreeRegistry()
+	// 将外部（树外）插件注册表合并到内置注册表中。
 	if err := registry.Merge(options.frameworkOutOfTreeRegistry); err != nil {
 		return nil, err
 	}
 
+	// 创建一个空的快照，用于存储 Node 信息，供调度框架使用。
 	snapshot := internalcache.NewEmptySnapshot()
+	// 创建集群事件映射，用于跟踪不同事件类型需要触发的调度器配置文件。
 	clusterEventMap := make(map[framework.ClusterEvent]sets.String)
 
+	// 创建配置器，它负责根据配置选项和插件注册表创建调度器的核心组件。
 	configurator := &Configurator{
-		componentConfigVersion:   options.componentConfigVersion,
-		client:                   client,
-		kubeConfig:               options.kubeConfig,
-		recorderFactory:          recorderFactory,
-		informerFactory:          informerFactory,
-		schedulerCache:           schedulerCache,
-		StopEverything:           stopEverything,
-		percentageOfNodesToScore: options.percentageOfNodesToScore,
-		podInitialBackoffSeconds: options.podInitialBackoffSeconds,
-		podMaxBackoffSeconds:     options.podMaxBackoffSeconds,
-		profiles:                 append([]schedulerapi.KubeSchedulerProfile(nil), options.profiles...),
-		registry:                 registry,
-		nodeInfoSnapshot:         snapshot,
-		extenders:                options.extenders,
-		frameworkCapturer:        options.frameworkCapturer,
-		parallellism:             options.parallelism,
-		clusterEventMap:          clusterEventMap,
+		componentConfigVersion:   options.componentConfigVersion,                                        // 组件配置版本。
+		client:                   client,                                                                // API 客户端。
+		kubeConfig:               options.kubeConfig,                                                    // KubeConfig。
+		recorderFactory:          recorderFactory,                                                       // 事件记录器工厂。
+		informerFactory:          informerFactory,                                                       // Informer 工厂。
+		schedulerCache:           schedulerCache,                                                        // 调度器缓存。
+		StopEverything:           stopEverything,                                                        // 停止信号通道。
+		percentageOfNodesToScore: options.percentageOfNodesToScore,                                      // 评分节点的百分比。
+		podInitialBackoffSeconds: options.podInitialBackoffSeconds,                                      // Pod 初始回退秒数。
+		podMaxBackoffSeconds:     options.podMaxBackoffSeconds,                                          // Pod 最大回退秒数。
+		profiles:                 append([]schedulerapi.KubeSchedulerProfile(nil), options.profiles...), // 调度器配置文件。
+		registry:                 registry,                                                              // 插件注册表。
+		nodeInfoSnapshot:         snapshot,                                                              // Node 信息快照。
+		extenders:                options.extenders,                                                     // 调度器扩展器。
+		frameworkCapturer:        options.frameworkCapturer,                                             // 框架捕获器。
+		parallellism:             options.parallelism,                                                   // 并行度。
+		clusterEventMap:          clusterEventMap,                                                       // 集群事件映射。
 	}
 
+	// 注册调度器相关的指标。
 	metrics.Register()
 
 	var sched *Scheduler
+	// 判断是否使用了旧版策略配置（Legacy Policy Source）。
 	if options.legacyPolicySource == nil {
-		// Create the config from component config
+		// 没有使用旧版策略，直接从组件配置创建调度器。
+		klog.Info("没有使用旧版策略，直接从组件配置创建调度器。")
 		sc, err := configurator.create()
 		if err != nil {
 			return nil, fmt.Errorf("couldn't create scheduler: %v", err)
 		}
 		sched = sc
 	} else {
-		// Create the config from a user specified policy source.
+		klog.Info("使用旧版策略，从文件或configMap中加载")
+		// 使用了旧版策略，需要从文件或 ConfigMap 加载策略。
 		policy := &schedulerapi.Policy{}
 		switch {
 		case options.legacyPolicySource.File != nil:
+			// 从文件加载策略。
 			if err := initPolicyFromFile(options.legacyPolicySource.File.Path, policy); err != nil {
 				return nil, err
 			}
 		case options.legacyPolicySource.ConfigMap != nil:
+			// 从 ConfigMap 加载策略。
 			if err := initPolicyFromConfigMap(client, options.legacyPolicySource.ConfigMap, policy); err != nil {
 				return nil, err
 			}
 		}
-		// Set extenders on the configurator now that we've decoded the policy
-		// In this case, c.extenders should be nil since we're using a policy (and therefore not componentconfig,
-		// which would have set extenders in the above instantiation of Configurator from CC options)
+		// 将从策略中解析出的扩展器设置到配置器上。
+		// 在使用策略的情况下，这些扩展器不会通过组件配置选项预先设置。
 		configurator.extenders = policy.Extenders
+		// 根据加载的策略创建调度器。
 		sc, err := configurator.createFromPolicy(*policy)
 		if err != nil {
 			return nil, fmt.Errorf("couldn't create scheduler from policy: %v", err)
@@ -306,19 +338,25 @@ func New(client clientset.Interface,
 		sched = sc
 	}
 
-	// Additional tweaks to the config produced by the configurator.
-	sched.StopEverything = stopEverything
-	sched.client = client
+	// 对配置器创建的调度器实例进行额外的调整。
+	sched.StopEverything = stopEverything // 设置停止信号通道。
+	sched.client = client                 // 设置 API 客户端。
 
-	// Build dynamic client and dynamic informer factory
+	// 构建动态客户端和动态 Informer 工厂（用于处理 CRD 等动态资源）。
 	var dynInformerFactory dynamicinformer.DynamicSharedInformerFactory
-	// options.kubeConfig can be nil in tests.
+	// options.kubeConfig 在测试中可能为 nil。
 	if options.kubeConfig != nil {
+		klog.Info("创建动态客户端")
+		// 创建动态客户端。
 		dynClient := dynamic.NewForConfigOrDie(options.kubeConfig)
+		// 创建动态 Informer 工厂。
 		dynInformerFactory = dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynClient, 0, v1.NamespaceAll, nil)
 	}
 
+	// 为调度器添加所有必要的事件处理器，监听 Pod、Node 等资源的变化。
 	addAllEventHandlers(sched, informerFactory, dynInformerFactory, unionedGVKs(clusterEventMap))
+
+	// 返回创建好的调度器实例。
 	return sched, nil
 }
 

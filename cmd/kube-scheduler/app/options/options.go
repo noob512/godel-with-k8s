@@ -72,47 +72,64 @@ type Options struct {
 	Flags *cliflag.NamedFlagSets
 }
 
-// NewOptions returns default scheduler app options.
+// NewOptions 返回默认的调度器应用程序选项。
+// 该函数初始化并返回一个包含默认配置的 Options 结构体指针，
+// 用于配置 Kubernetes 调度器的各个方面，如安全服务、认证、授权、领导者选举等。
 func NewOptions() *Options {
 	o := &Options{
+		// SecureServing: 配置安全（HTTPS）服务选项，并设置为使用本地回环地址。
 		SecureServing: apiserveroptions.NewSecureServingOptions().WithLoopback(),
+		// CombinedInsecureServing: 配置不安全（HTTP）服务选项，包括健康检查和指标端点，
+		// 并设置为使用本地回环地址。
 		CombinedInsecureServing: &CombinedInsecureServingOptions{
 			Healthz: (&apiserveroptions.DeprecatedInsecureServingOptions{
-				BindNetwork: "tcp",
-			}).WithLoopback(),
+				BindNetwork: "tcp", // 指定绑定网络协议为 TCP。
+			}).WithLoopback(), // 设置健康检查端点使用本地回环地址。
 			Metrics: (&apiserveroptions.DeprecatedInsecureServingOptions{
-				BindNetwork: "tcp"}).WithLoopback(),
+				BindNetwork: "tcp"}).WithLoopback(), // 设置指标端点使用本地回环地址。
 		},
+		// Authentication: 配置调度器的认证选项，用于验证请求来源。
 		Authentication: apiserveroptions.NewDelegatingAuthenticationOptions(),
-		Authorization:  apiserveroptions.NewDelegatingAuthorizationOptions(),
+		// Authorization: 配置调度器的授权选项，用于确定请求是否有权限执行操作。
+		Authorization: apiserveroptions.NewDelegatingAuthorizationOptions(),
+		// Deprecated: 包含一些已弃用的选项，用于向后兼容或特定的旧策略配置。
 		Deprecated: &DeprecatedOptions{
-			UseLegacyPolicyConfig:    false,
-			PolicyConfigMapNamespace: metav1.NamespaceSystem,
+			UseLegacyPolicyConfig:    false,                  // 不使用旧版策略配置。
+			PolicyConfigMapNamespace: metav1.NamespaceSystem, // 指定策略 ConfigMap 所在的命名空间为系统命名空间。
 		},
+		// LeaderElection: 配置领导者选举选项，确保在多副本部署中只有一个调度器实例处于活动状态。
 		LeaderElection: &componentbaseconfig.LeaderElectionConfiguration{
-			LeaderElect:       true,
-			LeaseDuration:     metav1.Duration{Duration: 15 * time.Second},
-			RenewDeadline:     metav1.Duration{Duration: 10 * time.Second},
-			RetryPeriod:       metav1.Duration{Duration: 2 * time.Second},
-			ResourceLock:      "leases",
-			ResourceName:      "kube-scheduler",
-			ResourceNamespace: "kube-system",
+			LeaderElect:       true,                                        // 启用领导者选举。
+			LeaseDuration:     metav1.Duration{Duration: 15 * time.Second}, // 租约持续时间，即领导者认为自己有效的时长。
+			RenewDeadline:     metav1.Duration{Duration: 10 * time.Second}, // 续约截止时间，领导者尝试续约的截止时间。
+			RetryPeriod:       metav1.Duration{Duration: 2 * time.Second},  // 重试周期，尝试获取或续租的间隔。
+			ResourceLock:      "leases",                                    // 用于领导者选举的资源锁类型，这里使用 "leases"。
+			ResourceName:      "kube-scheduler",                            // 用于领导者选举的资源名称。
+			ResourceNamespace: "kube-system",                               // 用于领导者选举的资源命名空间。
 		},
+		// Metrics: 配置调度器的指标收集选项。
 		Metrics: metrics.NewOptions(),
-		Logs:    logs.NewOptions(),
+		// Logs: 配置调度器的日志记录选项。
+		Logs: logs.NewOptions(),
 	}
 
-	o.Authentication.TolerateInClusterLookupFailure = true
-	o.Authentication.RemoteKubeConfigFileOptional = true
-	o.Authorization.RemoteKubeConfigFileOptional = true
+	// 配置认证选项，容忍集群内查找失败，允许远程 KubeConfig 文件可选。
+	o.Authentication.TolerateInClusterLookupFailure = true // 在集群内查找认证信息失败时容忍，不直接报错。
+	o.Authentication.RemoteKubeConfigFileOptional = true   // 远程 KubeConfig 文件是可选的，即使未提供也能继续运行。
+	// 配置授权选项，允许远程 KubeConfig 文件可选。
+	o.Authorization.RemoteKubeConfigFileOptional = true // 远程 KubeConfig 文件是可选的。
 
+	// 设置安全服务的证书选项，使用内存中生成的证书。
 	// Set the PairName but leave certificate directory blank to generate in-memory by default
-	o.SecureServing.ServerCert.CertDirectory = ""
-	o.SecureServing.ServerCert.PairName = "kube-scheduler"
+	o.SecureServing.ServerCert.CertDirectory = ""          // 证书目录为空，表示使用内存中的证书。
+	o.SecureServing.ServerCert.PairName = "kube-scheduler" // 证书对的名称。
+	// 设置安全服务的绑定端口为默认的调度器端口。
 	o.SecureServing.BindPort = kubeschedulerconfig.DefaultKubeSchedulerPort
 
+	// 初始化命令行标志。
 	o.initFlags()
 
+	// 返回配置好的选项结构体。
 	return o
 }
 
