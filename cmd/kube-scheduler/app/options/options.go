@@ -22,19 +22,18 @@ import (
 	clientsetscheme "k8s.io/client-go/kubernetes/scheme"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/klog/v2"
-	utilpointer "k8s.io/utils/pointer"
 	"math"
 	"net"
 	"os"
 	"strconv"
 	"time"
+	godelclient "github.com/kubewharf/godel-scheduler-api/pkg/client/clientset/versioned"
+	godelclientscheme "github.com/kubewharf/godel-scheduler-api/pkg/client/clientset/versioned/scheme"
+	crdinformers "github.com/kubewharf/godel-scheduler-api/pkg/client/informers/externalversions"
 	//-----------------------------------------------------------------------------------
 	godelschedulerconfig "github.com/kubewharf/godel-scheduler/pkg/scheduler/apis/config"
-	godelclientscheme "github.com/kubewharf/godel-scheduler-api/pkg/client/clientset/versioned/scheme"
-	Godelcomponentbaseconfig "k8s.io/component-base/config/v1alpha1"
-	godelclient "github.com/kubewharf/godel-scheduler-api/pkg/client/clientset/versioned"
 	"github.com/kubewharf/godel-scheduler/pkg/util/tracing"
-	crdinformers "github.com/kubewharf/godel-scheduler-api/pkg/client/informers/externalversions"
+	Godelcomponentbaseconfig "k8s.io/component-base/config/v1alpha1"
 	//----------------------------------------------------------------------------------
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
@@ -313,12 +312,14 @@ func SetDefaults_GodelSchedulerConfiguration(obj *godelschedulerconfig.GodelSche
 
 		// 默认不禁用抢占（Preemption）
 		if obj.DefaultProfile.DisablePreemption == nil {
-			obj.DefaultProfile.DisablePreemption = utilpointer.BoolPtr(DefaultDisablePreemption)
+			value := true
+			obj.DefaultProfile.DisablePreemption = &value
 		}
 
 		// 默认不禁用阻塞队列（BlockQueue）功能
-		if obj.DefaultProfile.BlockQueue == nil {
-			obj.DefaultProfile.BlockQueue = utilpointer.BoolPtr(DefaultBlockQueue)
+		if obj.DefaultProfile.DisablePreemption == nil {
+			value := false
+			obj.DefaultProfile.DisablePreemption = &value
 		}
 
 		// 设置等待删除 Pod 的最大容忍时长（用于资源回收）
@@ -328,7 +329,8 @@ func SetDefaults_GodelSchedulerConfiguration(obj *godelschedulerconfig.GodelSche
 
 		// 设置候选节点选择策略（如随机选择）
 		if obj.DefaultProfile.CandidatesSelectPolicy == nil {
-			obj.DefaultProfile.CandidatesSelectPolicy = utilpointer.String(CandidateSelectPolicyRandom)
+			value := CandidateSelectPolicyRandom
+			obj.DefaultProfile.CandidatesSelectPolicy = &value
 		}
 
 		// 设置更优节点选择策略列表（用于抢占决策，如升序、二分查找等）
