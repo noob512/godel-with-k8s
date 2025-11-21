@@ -247,7 +247,7 @@ func SetDefaults_GodelSchedulerConfiguration(obj *godelschedulerconfig.GodelSche
 	{
 		// 若未设置 Godel 调度器名称，使用默认名称
 		if len(obj.GodelSchedulerName) == 0 {
-			obj.GodelSchedulerName = DefaultGodelSchedulerName //这个可以自定义
+			obj.GodelSchedulerName = "my-cus-k8s"+DefaultGodelSchedulerName //这个可以自定义
 		}
 
 		// 设置 Kubernetes 侧使用的调度器名称（用于 Pod.Spec.SchedulerName）
