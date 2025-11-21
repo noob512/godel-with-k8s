@@ -19,7 +19,21 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"github.com/kubewharf/godel-scheduler-api/pkg/apis/scheduling/v1alpha1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/tools/events"
+
+	//--------------------------------------------------------------------------------
+	godelclient "github.com/kubewharf/godel-scheduler-api/pkg/client/clientset/versioned"
+	crdinformers "github.com/kubewharf/godel-scheduler-api/pkg/client/informers/externalversions"
+	godelframework "github.com/kubewharf/godel-scheduler/pkg/framework/api"
+	"github.com/kubewharf/godel-scheduler/pkg/scheduler/apis/config"
+	godelcache "github.com/kubewharf/godel-scheduler/pkg/scheduler/cache"
+	godelutil "github.com/kubewharf/godel-scheduler/pkg/util"
+	"k8s.io/apimachinery/pkg/util/clock"
+	//--------------------------------------------------------------------------------
 	"io/ioutil"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"math/rand"
 	"os"
 	"strconv"
@@ -39,10 +53,8 @@ import (
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
-	"k8s.io/kube-scheduler/config/v1beta2"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
-	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/scheme"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
@@ -65,37 +77,302 @@ const (
 	// See issue #106361 for more details about this parameter and its value.
 	durationToExpireAssumedPod = 2 * time.Minute
 )
+//-----------------------------------------------------------------
+type subClusterConfig struct {
+	PercentageOfNodesToScore          int32
+	IncreasedPercentageOfNodesToScore int32
+
+	MaxWaitingDeletionDuration int64
+
+	UseBlockQueue                 bool
+	UnitInitialBackoffSeconds     int64
+	UnitMaxBackoffSeconds         int64
+	AttemptImpactFactorOnPriority float64
+
+	BasePlugins             godelframework.PluginCollectionSet
+	PluginConfigs           []config.PluginConfig
+	PreemptionPluginConfigs []config.PluginConfig
+	UnitQueueSortPlugin     *godelframework.PluginSpec
+
+	DisablePreemption      bool
+	CandidatesSelectPolicy string
+	BetterSelectPolicies   []string
+
+	EnableStore map[string]bool
+}
+
+const (
+	// maxUpdateRetries is the number of immediate, successive retries the Scheduler will attempt
+	// when renewing the Scheduler status before it waits for the renewal interval before trying again,
+	// similar to what we do for node status retries
+	maxUpdateRetries = 5
+	// sleep is the default interval for retry
+	sleep = 100 * time.Millisecond
+)
+
+// StatusMaintainer manages creating and renewing the status for this Scheduler
+type StatusMaintainer interface {
+	Run(stopCh <-chan struct{})
+}
+type maintainer struct {
+	crdClient     godelclient.Interface
+	schedulerName string
+	renewInterval time.Duration
+	clock         clock.Clock
+}
+
+// Run 启动调度器状态维护器的主循环。
+// 它会定期同步调度器的状态信息到自定义资源定义（CRD）中，直到收到停止信号。
+func (c *maintainer) Run(stopCh <-chan struct{}) {
+	// 检查 CRD 客户端是否已初始化。
+	// CRD 客户端用于与存储调度器状态的 CRD 进行交互。
+	if c.crdClient == nil {
+		// 如果客户端为 nil，记录错误日志并退出程序。
+		// 这通常意味着配置错误或依赖注入失败。
+		klog.Info("c.crdClient为nil")
+		klog.ErrorS(nil, "Exited the scheduler status maintainer because the CRD client was nil", "schedulerName", c.schedulerName)
+		// 确保日志被刷新到输出，然后以退出码 1 结束程序。
+	}
+	// 启动一个无限循环，定期执行同步操作。
+	// wait.Until 会按照 c.renewInterval 指定的时间间隔，调用 c.sync 方法。
+	// 当 stopCh 通道被关闭时，循环会停止，Run 方法返回。
+	klog.Info("c.crdClient不为nil")
+	wait.Until(c.sync, c.renewInterval, stopCh)
+}
+
+// sync attempts to update the status for Scheduler
+// update Status.LastUpdateTime at the moment
+// sync 同步调度器的当前状态到其对应的 CRD（自定义资源定义）中。
+// 它尝试更新 CRD 对象以反映调度器的最新状态（如健康状况、活跃节点列表等）。
+// 如果更新失败，它会记录一条信息日志，然后在下次定时周期重试。
+func (c *maintainer) sync() {
+	// 调用 ensureSchedulerUpToDate 函数来执行实际的状态更新逻辑。
+	// 该函数会使用 c.crdClient 与 API Server 通信，更新与 c.schedulerName 相关的 CRD 状态。
+	if err := ensureSchedulerUpToDate(c.crdClient, c.clock, c.schedulerName); err != nil {
+		// 如果更新失败（例如网络问题、权限不足、资源冲突等），
+		// 记录一条 Info 级别的日志，告知用户更新失败，并将在下一次 sync 周期（由 c.renewInterval 控制）重试。
+		klog.InfoS("Failed to update scheduler status, will retry later", "schedulerName", c.schedulerName, "renewInterval", c.renewInterval)
+	}
+	// 如果更新成功，函数静默返回，等待下一次定时调用。
+}
+
+// ensureSchedulerUpToDate try to update scheduler status, if failed, retry after sleep duration, at most maxUpdateRetries
+// ensureSchedulerUpToDate 确保调度器的状态在 CRD 中保持最新。
+// 它会尝试最多 maxUpdateRetries 次调用 updateSchedulerStatus 来更新状态。
+// 如果所有重试都失败，则返回一个错误。
+func ensureSchedulerUpToDate(client godelclient.Interface, clock clock.Clock, schedulerName string) error {
+	// 循环最多 maxUpdateRetries 次，尝试更新调度器状态。
+	for i := 0; i < maxUpdateRetries; i++ {
+		// 调用 updateSchedulerStatus 尝试更新调度器在 CRD 中的状态。
+		err := updateSchedulerStatus(client, schedulerName)
+		klog.Info("更新一次调度器资源")
+		if err != nil {
+			// 如果更新失败，记录一条 Info 日志，包含错误信息。
+			klog.InfoS("Failed to update scheduler, will retry later", "schedulerName", schedulerName, "err", err)
+			// 使用 clock.Sleep 暂停 sleep 时间，然后再进行下一次重试。
+			// 这可以避免在失败时进行过于频繁的 API 调用。
+			clock.Sleep(sleep)
+			// 继续下一次循环尝试更新。
+			continue
+		}
+		// 如果更新成功（err 为 nil），则退出函数，返回 nil。
+		return nil
+	}
+	// 如果循环结束仍未成功（即 maxUpdateRetries 次都失败了），
+	// 返回一个格式化的错误，表明所有重试都已用尽。
+	return fmt.Errorf("failed %d attempts to update scheduler status", maxUpdateRetries)
+}
+
+// updateSchedulerStatus tries to update Scheduler status to apiserver, if Scheduler not exists, add new Scheduler to apiserver
+// updateSchedulerStatus 更新或创建指定名称的调度器 CRD 对象及其状态。
+// 它会尝试获取现有的调度器 CRD，如果存在则更新其状态中的最后更新时间；
+// 如果不存在，则创建一个新的调度器 CRD 对象，并随后更新其状态。
+func updateSchedulerStatus(client godelclient.Interface, schedulerName string) error {
+	// 获取当前时间，用于记录最后更新时间。
+	now := metav1.Now()
+
+	//schedulerName+="-my-custom"
+	// 尝试从 API Server 获取指定名称的调度器 CRD 对象。
+	existed, err := godelutil.GetScheduler(client, schedulerName)
+	if err == nil && existed != nil {
+		// 如果获取成功且对象存在。
+		// 创建一个现有对象的深拷贝，以避免修改原始对象。
+		updated := existed.DeepCopy()
+		// 更新深拷贝对象的状态，设置最后更新时间为当前时间。
+		updated.Status.LastUpdateTime = &now
+
+		// 调用工具函数更新调度器 CRD 的状态子资源。
+		if _, err := godelutil.UpdateSchedulerStatus(client, updated); err != nil {
+			// 如果更新状态失败，包装错误信息并返回，以便调用方进行重试。
+			err = fmt.Errorf("failed to update scheduler %v, will retry later, error is %v", schedulerName, err)
+			return err
+		}
+		// 更新成功，返回 nil。
+		return nil
+	}
+
+	// 检查获取失败的原因是否是因为对象不存在 (IsNotFound)。
+	// 如果不是 NotFound 错误，说明是其他问题（如网络、权限等），记录错误并返回。
+	if !apierrors.IsNotFound(err) {
+		err = fmt.Errorf("failed to get scheduler %v, will retry later, error is %v", schedulerName, err)
+		return err
+	}
+
+	// 如果错误是 NotFound (apierrors.IsNotFound(err) 为 true)，
+	// 表示调度器 CRD 对象不存在。记录警告日志。
+	klog.InfoS("WARN: scheduler was gone, should check this", "schedulerName", schedulerName, "err", err)
+
+	// 准备创建一个新的调度器 CRD 对象。
+	schedulerCRD := &v1alpha1.Scheduler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: schedulerName, // 设置对象名称。
+		},
+		// Status 字段可能在创建时是空的，稍后会单独更新。
+	}
+
+	// 调用工具函数创建调度器 CRD 对象。
+	created, err := godelutil.PostScheduler(client, schedulerCRD)
+	if err != nil {
+		// 检查创建失败的原因是否是因为对象已存在 (IsAlreadyExists)。
+		// 这可能发生在并发场景下。
+		if apierrors.IsAlreadyExists(err) {
+			// 如果是因为已存在，记录警告日志，但不视为错误，返回 nil。
+			// 这可能意味着在检查和创建之间，另一个实例已经创建了该对象。
+			klog.InfoS("WARN: skipped register because scheduler already existed", "schedulerName", schedulerName, "err", err)
+			return nil
+		}
+		// 如果是其他创建错误，包装错误信息并返回。
+		err = fmt.Errorf("failed to update scheduler %v, will retry later, error is %v", schedulerName, err)
+		return err
+	}
+
+	// 创建成功。通常，创建对象时无法直接设置 status 子资源。
+	// 因此，需要单独更新 status。
+	// 更新刚创建对象的状态，设置最后更新时间为当前时间。
+	created.Status.LastUpdateTime = &now
+	// 调用工具函数更新调度器 CRD 的状态子资源。
+	if _, err := godelutil.UpdateSchedulerStatus(client, created); err != nil {
+		// 如果更新状态失败，包装错误信息并返回。
+		err = fmt.Errorf("failed to update scheduler %v, will retry later, error is %v", schedulerName, err)
+		return err
+	}
+	// 成功创建并更新状态，返回 nil。
+	return nil
+}
+
+// NewSchedulerStatusMaintainer constructs and returns a maintainer
+func NewSchedulerStatusMaintainer(clock clock.Clock, client godelclient.Interface, schedulerName string, renewIntervalSeconds int64) StatusMaintainer {
+	renewInterval := time.Duration(renewIntervalSeconds) * time.Second
+	return &maintainer{
+		crdClient:     client,
+		schedulerName: schedulerName,
+		renewInterval: renewInterval,
+		clock:         clock,
+	}
+}
+
+// onSchedulerUpdate 是一个事件处理器函数，当监听的 Scheduler 自定义资源 (CRD) 发生更新时被调用。
+// 此函数目前的实现是无条件地触发调度器的调度开关 (ScheduleSwitch)，
+// 但具体的处理逻辑（在 Process 函数的回调中）是空的。
+// 参数 `oldObj` 和 `newObj` 分别代表更新前和更新后的 Scheduler 对象，
+// 但在此函数中并未使用它们的具体内容。
+func (sched *Scheduler) onSchedulerUpdate(oldObj, newObj interface{}) {
+	klog.Info("onSchedulerUpdate函数被调用")
+	//// 调用调度开关的 Process 方法。
+	//// 这通常用于通知调度器其内部状态或配置可能已更改，需要进行相应处理。
+	//sched.ScheduleSwitch.Process(
+	//	//
+	//	// 目前硬编码为 framework.SwitchTypeAll，表示可能需要处理所有类型的变更。
+	//	godelframework.SwitchTypeAll,
+	//	// 传入一个空的处理函数。
+	//	// 这个函数接收一个 ScheduleDataSet 参数，该参数理论上包含更新所需的数据。
+	//	// 但当前实现中，此函数体为空，意味着没有实际的处理逻辑。
+	//	func(dataSet ScheduleDataSet) {},
+	//)
+}
+//-----------------------------------------------------------
 
 // Scheduler watches for new unscheduled pods. It attempts to find
 // nodes that they fit on and writes bindings back to the api server.
+// Scheduler 是 Kubernetes 调度器的核心结构体。
+// 它整合了调度器的各个组件，包括缓存、算法、扩展器、队列和配置集，负责执行 Pod 的调度逻辑。
 type Scheduler struct {
-	// It is expected that changes made via SchedulerCache will be observed
-	// by NodeLister and Algorithm.
+	//------------------------------------------------------------
+	// Name 用于标识这个 Godel 调度器实例的名称。
+	Name string
+	// SchedulerName 是更高层级的调度器名称，用于选择哪些 Pod 应由 Godel 调度器负责，
+	// 并过滤掉不相关的 Pod。
+	// Pod 的 Spec.SchedulerName 必须与此字段匹配，才会被此调度器处理。
+	SchedulerName *string
+
+	// informerFactory 是标准 Kubernetes 核心资源的 SharedInformer 工厂。
+	informerFactory informers.SharedInformerFactory
+
+	// crdInformerFactory 是 Godel 自定义资源的 SharedInformer 工厂。
+	crdInformerFactory crdinformers.SharedInformerFactory
+
+	// crdClient 是 Godel 自定义资源（如 Scheduler, PodGroup 等）的客户端接口。
+	crdClient godelclient.Interface
+
+	// options 存储调度器的配置选项。
+	options schedulerOptions
+
+	// podLister 是 Pod 资源的 Lister，提供对 Pod 信息的只读缓存访问。
+	podLister corelisters.PodLister
+
+	// commonCache 是调度器使用的缓存接口，用于存储和管理节点、Pod 等资源的状态信息。
+	commonCache godelcache.SchedulerCache
+
+	// mayHasPreemption 标记此调度器实例是否可能执行抢占（Preemption）操作。
+	mayHasPreemption bool
+	// defaultSubClusterConfig 是默认子集群的配置。
+	defaultSubClusterConfig *subClusterConfig
+
+
+	// schedulerMaintainer 是一个状态维护器，负责维护和更新调度器自身的状态。
+	schedulerMaintainer StatusMaintainer
+
+
+	// recorder 是事件记录器，用于向 Kubernetes API Server 发送调度器相关的事件。
+	// 根据 KEP 383，这应该是新的 events.k8s.io/v1 API 的适配器。
+	recorder events.EventRecorder
+
+	//------------------------------------------------------------
+	// SchedulerCache 是调度器的内部缓存，维护了集群的节点和 Pod 状态。
+	// NodeLister 和 Algorithm 预期能观察到通过此缓存所做的更改。
+	// 这是调度决策所需数据的主要来源。
 	SchedulerCache internalcache.Cache
 
+	// Algorithm 是调度器的核心调度算法实现。
+	// 它负责执行具体的调度流程，如过滤节点和为 Pod 评分。
+	// （在新版调度框架中，这个字段可能被 Profiles 中的框架取代，但可能仍保留用于兼容性或特定逻辑）
 	Algorithm ScheduleAlgorithm
 
+	// Extenders 是一个调度扩展器列表。
+	// 调度器在执行调度决策时会调用这些扩展器，以支持更复杂的调度逻辑或外部系统集成。
 	Extenders []framework.Extender
 
-	// NextPod should be a function that blocks until the next pod
-	// is available. We don't use a channel for this, because scheduling
-	// a pod may take some amount of time and we don't want pods to get
-	// stale while they sit in a channel.
+	// NextPod 是一个函数，用于从调度队列中获取下一个待调度的 Pod。
+	// 它会阻塞直到有新的 Pod 可用，避免了使用通道时 Pod 可能变旧的问题。
 	NextPod func() *framework.QueuedPodInfo
 
-	// Error is called if there is an error. It is passed the pod in
-	// question, and the error
+	// Error 是一个回调函数，当调度过程中发生错误时调用。
+	// 它接收出错的 Pod 信息和错误详情。
 	Error func(*framework.QueuedPodInfo, error)
 
-	// Close this to shut down the scheduler.
+	// StopEverything 是一个只读的信号通道。
+	// 关闭此通道会通知调度器的所有组件停止运行。
 	StopEverything <-chan struct{}
 
-	// SchedulingQueue holds pods to be scheduled
+	// SchedulingQueue 是存储等待调度的 Pod 的队列。
+	// Pod 在这里排队等待被调度器处理。
 	SchedulingQueue internalqueue.SchedulingQueue
 
-	// Profiles are the scheduling profiles.
+	// Profiles 是调度配置集的映射。
+	// 每个配置集定义了一套独立的调度策略和插件，允许一个调度器实例支持多种调度行为。
 	Profiles profile.Map
 
+	// client 是一个标准的 Kubernetes API 客户端，用于与 API 服务器通信（如绑定 Pod 到节点）。
 	client clientset.Interface
 }
 
@@ -216,6 +493,20 @@ var defaultSchedulerOptions = schedulerOptions{
 	applyDefaultProfile: true,
 }
 
+//-------------------------------------------------------------
+type GodelschedulerOptions struct {
+	defaultProfile     *config.GodelSchedulerProfile
+	subClusterProfiles map[string]config.GodelSchedulerProfile
+
+	renewInterval int64
+	subClusterKey string
+}
+var defaultGodelSchedulerOptions = GodelschedulerOptions{
+	renewInterval: config.DefaultRenewIntervalInSeconds,
+	subClusterKey: config.DefaultSubClusterKey,
+}
+//--------------------------------------------------------
+
 // New 返回一个新的调度器实例。
 // 该函数负责初始化调度器的核心组件，包括缓存、插件注册表、配置器，并根据配置创建调度器对象。
 //
@@ -229,7 +520,12 @@ var defaultSchedulerOptions = schedulerOptions{
 // 返回:
 // - *Scheduler: 创建好的调度器实例。
 // - error: 如果在创建过程中发生任何错误，则返回错误。
-func New(client clientset.Interface,
+func New(
+	godelSchedulerName string,
+	schedulerName *string,
+	crdClient godelclient.Interface,
+	crdInformerFactory crdinformers.SharedInformerFactory,
+	client clientset.Interface,
 	informerFactory informers.SharedInformerFactory,
 	recorderFactory profile.RecorderFactory,
 	stopCh <-chan struct{},
@@ -243,23 +539,29 @@ func New(client clientset.Interface,
 
 	// 从默认调度器选项开始，并应用所有传入的选项来覆盖默认值。
 	options := defaultSchedulerOptions
+	//--------------------------------------------------
+	Godeloptions:=defaultGodelSchedulerOptions
+	globalClock := clock.RealClock{}
+	podLister := informerFactory.Core().V1().Pods().Lister()
+	//-------------------------------------------------
 	for _, opt := range opts {
 		opt(&options)
 	}
 
 	// 如果需要应用默认配置文件，则从 Scheme 的默认值创建配置文件。
-	if options.applyDefaultProfile {
-		klog.Info("应用默认配置文件")
-		var versionedCfg v1beta2.KubeSchedulerConfiguration
-		scheme.Scheme.Default(&versionedCfg) // 对版本化的配置对象设置默认值。
-		cfg := config.KubeSchedulerConfiguration{}
-		// 将版本化的配置对象转换为内部版本。
-		if err := scheme.Scheme.Convert(&versionedCfg, &cfg, nil); err != nil {
-			return nil, err
-		}
-		// 使用转换后的配置文件。
-		options.profiles = cfg.Profiles
-	}
+	//日志中没有打印，大概率没有使用下述代码
+	//if options.applyDefaultProfile {
+	//	klog.Info("应用默认配置文件")
+	//	var versionedCfg v1beta2.KubeSchedulerConfiguration
+	//	scheme.Scheme.Default(&versionedCfg) // 对版本化的配置对象设置默认值。
+	//	cfg := config.KubeSchedulerConfiguration{}
+	//	// 将版本化的配置对象转换为内部版本。
+	//	if err := scheme.Scheme.Convert(&versionedCfg, &cfg, nil); err != nil {
+	//		return nil, err
+	//	}
+	//	// 使用转换后的配置文件。
+	//	options.profiles = cfg.Profiles
+	//}
 
 	// 创建调度器内部缓存，用于存储 Pod、Node 等信息。
 	// durationToExpireAssumedPod 是假设 Pod 的过期时间。
@@ -304,13 +606,19 @@ func New(client clientset.Interface,
 	var sched *Scheduler
 	// 判断是否使用了旧版策略配置（Legacy Policy Source）。
 	if options.legacyPolicySource == nil {
+		//走的是这条路
 		// 没有使用旧版策略，直接从组件配置创建调度器。
 		klog.Info("没有使用旧版策略，直接从组件配置创建调度器。")
-		sc, err := configurator.create()
+		sc, err := configurator.create(godelSchedulerName,schedulerName,stopCh)
 		if err != nil {
 			return nil, fmt.Errorf("couldn't create scheduler: %v", err)
 		}
 		sched = sc
+		sched.mayHasPreemption=false
+		sched.schedulerMaintainer=NewSchedulerStatusMaintainer(globalClock, crdClient, godelSchedulerName, Godeloptions.renewInterval)
+		sched.podLister=podLister
+		sched.informerFactory=informerFactory
+		sched.crdInformerFactory=crdInformerFactory
 	} else {
 		klog.Info("使用旧版策略，从文件或configMap中加载")
 		// 使用了旧版策略，需要从文件或 ConfigMap 加载策略。
@@ -354,7 +662,7 @@ func New(client clientset.Interface,
 	}
 
 	// 为调度器添加所有必要的事件处理器，监听 Pod、Node 等资源的变化。
-	addAllEventHandlers(sched, informerFactory, dynInformerFactory, unionedGVKs(clusterEventMap))
+	addAllEventHandlers(sched, informerFactory, dynInformerFactory,crdInformerFactory, unionedGVKs(clusterEventMap))
 
 	// 返回创建好的调度器实例。
 	return sched, nil
@@ -410,6 +718,7 @@ func initPolicyFromConfigMap(client clientset.Interface, policyRef *schedulerapi
 
 // Run begins watching and scheduling. It starts scheduling and blocked until the context is done.
 func (sched *Scheduler) Run(ctx context.Context) {
+	go sched.schedulerMaintainer.Run(sched.StopEverything)
 	sched.SchedulingQueue.Run()
 	wait.UntilWithContext(ctx, sched.scheduleOne, 0)
 	sched.SchedulingQueue.Close()

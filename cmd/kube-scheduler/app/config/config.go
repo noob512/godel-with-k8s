@@ -17,6 +17,12 @@ limitations under the License.
 package config
 
 import (
+	//-------------------------------------------------------------------------------
+	godelclient "github.com/kubewharf/godel-scheduler-api/pkg/client/clientset/versioned"
+	crdinformers "github.com/kubewharf/godel-scheduler-api/pkg/client/informers/externalversions"
+	"github.com/kubewharf/godel-scheduler/pkg/scheduler/apis/config"
+
+	//-------------------------------------------------------------------------------
 	apiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
@@ -26,30 +32,64 @@ import (
 	kubeschedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
 )
 
+//---------------------------------------------------------------------------
+
 // Config has all the context to run a Scheduler
+// Config 定义了调度器应用程序运行所需的所有核心配置。
+// 它整合了调度器的配置对象、API 服务器设置、Kubernetes 客户端、事件广播器和领导者选举配置等。
 type Config struct {
-	// ComponentConfig is the scheduler server's configuration object.
+	//----------------------------------------------------------------
+	// GodelCrdClient 是 Godel 自定义资源（如 Scheduler, PodGroup 等）的客户端接口。
+	GodelCrdClient godelclient.Interface
+	// GodelCrdInformerFactory 是 Godel 自定义资源的 SharedInformer 工厂，用于监听和缓存 Godel CRD 资源的变化。
+	GodelCrdInformerFactory crdinformers.SharedInformerFactory
+	GodelComponentConfig    config.GodelSchedulerConfiguration
+	//------------------------------------------------------------------
+	// ComponentConfig 是调度器服务器的主配置对象。
+	// 它包含了调度策略、插件、调度周期等核心调度行为的定义。
 	ComponentConfig kubeschedulerconfig.KubeSchedulerConfiguration
 
+	// LegacyPolicySource 指向旧版调度策略的来源，用于向后兼容。
+	// 现代调度器通常使用调度配置集 (Profiles)。
 	LegacyPolicySource *kubeschedulerconfig.SchedulerPolicySource
 
-	// LoopbackClientConfig is a config for a privileged loopback connection
+	// LoopbackClientConfig 是一个用于特权环回连接的 REST 客户端配置。
+	// 这种连接通常用于调度器内部与 API 服务器的通信，可能拥有更高的权限。
 	LoopbackClientConfig *restclient.Config
 
-	InsecureServing        *apiserver.DeprecatedInsecureServingInfo // nil will disable serving on an insecure port
-	InsecureMetricsServing *apiserver.DeprecatedInsecureServingInfo // non-nil if metrics should be served independently
-	Authentication         apiserver.AuthenticationInfo
-	Authorization          apiserver.AuthorizationInfo
-	SecureServing          *apiserver.SecureServingInfo
+	// InsecureServing 定义了调度器非安全 HTTP 端点的配置信息。
+	// 如果为 nil，则禁用不安全端口上的服务。通常用于健康检查。
+	InsecureServing *apiserver.DeprecatedInsecureServingInfo
 
-	Client          clientset.Interface
-	KubeConfig      *restclient.Config
+	// InsecureMetricsServing 定义了独立的、非安全 HTTP 端点的配置信息，专门用于暴露指标。
+	// 如果为 nil，则指标可能与健康检查或其他服务共享 InsecureServing 端口。
+	InsecureMetricsServing *apiserver.DeprecatedInsecureServingInfo
+
+	// Authentication 包含了 API 服务器的认证配置信息。
+	Authentication apiserver.AuthenticationInfo
+
+	// Authorization 包含了 API 服务器的授权配置信息。
+	Authorization apiserver.AuthorizationInfo
+
+	// SecureServing 定义了调度器安全 HTTPS 端点的配置信息，包括证书和密钥。
+	SecureServing *apiserver.SecureServingInfo
+
+	// Client 是一个标准的 Kubernetes API 客户端接口，用于与 API 服务器进行交互。
+	Client clientset.Interface
+
+	// KubeConfig 是用于创建 Kubernetes 客户端的原始配置对象。
+	KubeConfig *restclient.Config
+
+	// InformerFactory 是一个共享的 Informer 工厂，用于监听和缓存 Kubernetes API 对象（如 Pods, Nodes）。
+	// 调度器使用缓存的数据来做出调度决策。
 	InformerFactory informers.SharedInformerFactory
 
-	//lint:ignore SA1019 this deprecated field still needs to be used for now. It will be removed once the migration is done.
+	// EventBroadcaster 是一个事件广播器适配器，用于记录和发送调度器相关的事件到 API 服务器。
+	//lint:ignore SA1019 这个已弃用的字段目前仍需使用。迁移完成后将被移除。
 	EventBroadcaster events.EventBroadcasterAdapter
 
-	// LeaderElection is optional.
+	// LeaderElection 是领导者选举的配置对象，用于在高可用（HA）场景下确保只有一个调度器实例是活跃的。
+	// 此字段是可选的。
 	LeaderElection *leaderelection.LeaderElectionConfig
 }
 

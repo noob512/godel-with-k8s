@@ -274,34 +274,74 @@ func NewPriorityQueue(
 	return pq
 }
 
-// Run starts the goroutine to pump from podBackoffQ to activeQ
+// Run 启动两个后台 goroutine，用于定期维护调度队列。
+// 一个 goroutine 负责将完成退避时间的 Pod 从 backoffQ 移回 activeQ。
+// 另一个 goroutine 负责将长时间停留在 unschedulableQ 中的 Pod 移回 activeQ 或 backoffQ。
+// 这两个 goroutine 会持续运行，直到接收到停止信号 (p.stop)。
 func (p *PriorityQueue) Run() {
+	// 启动一个 goroutine，以 1 秒的间隔调用 p.flushBackoffQCompleted 方法。
+	// 这确保了在 backoffQ 中等待的 Pod 能够在其退避时间结束后尽快被移回 activeQ，参与下一轮调度。
 	go wait.Until(p.flushBackoffQCompleted, 1.0*time.Second, p.stop)
+
+	// 启动另一个 goroutine，以 30 秒的间隔调用 p.flushUnschedulableQLeftover 方法。
+	// 这允许在 unschedulableQ 中停留超过阈值的 Pod 有机会被重新评估和调度，
+	// 防止它们因集群状态变化而被永久搁置。
 	go wait.Until(p.flushUnschedulableQLeftover, 30*time.Second, p.stop)
 }
 
 // Add adds a pod to the active queue. It should be called only when a new pod
 // is added so there is no chance the pod is already in active/unschedulable/backoff queues
+// Add 将一个 Pod 添加到调度队列的 activeQ 中。
+// 这是 PriorityQueue 实现的 framework.PodQueue 接口的一部分。
+// 该方法确保 Pod 在添加到 activeQ 之前，不会同时存在于 unschedulableQ 或 podBackoffQ 中，
+// 以维护队列之间 Pod 状态的一致性。
 func (p *PriorityQueue) Add(pod *v1.Pod) error {
+	// 加锁以保证并发安全
 	p.lock.Lock()
 	defer p.lock.Unlock()
+
+	// 创建 QueuedPodInfo 对象，该对象封装了 Pod 及其在队列中的元数据（如入队时间戳、次序号等）
 	pInfo := p.newQueuedPodInfo(pod)
+
+	// 将 PodInfo 添加到 activeQ。activeQ 中的 Pod 是下一轮调度循环的候选者。
 	if err := p.activeQ.Add(pInfo); err != nil {
+		// 如果添加失败（例如队列已满或内部错误），记录错误并返回
 		klog.ErrorS(err, "Error adding pod to the scheduling queue", "pod", klog.KObj(pod))
 		return err
 	}
+
+	// 检查 Pod 是否意外地存在于 unschedulableQ 中。
+	// 理论上，在调用 Add 之前，Pod 不应该在 unschedulableQ 中，因为 Add 通常由 Pod 创建事件触发。
+	// 但如果存在，说明队列状态不一致，需要清理 unschedulableQ 中的记录。
 	if p.unschedulableQ.get(pod) != nil {
+		// 记录错误日志，表明存在状态不一致问题
 		klog.ErrorS(nil, "Error: pod is already in the unschedulable queue", "pod", klog.KObj(pod))
+		// 从 unschedulableQ 中删除该 Pod
 		p.unschedulableQ.delete(pod)
 	}
-	// Delete pod from backoffQ if it is backing off
+
+	// 检查 Pod 是否意外地存在于 podBackoffQ 中。
+	// 与 unschedulableQ 类似，如果存在，说明队列状态不一致。
+	// 这里使用 Delete 尝试从 podBackoffQ 中移除，如果成功 (err == nil)，说明 Pod 确实存在于 backoffQ。
 	if err := p.podBackoffQ.Delete(pInfo); err == nil {
+		// 记录错误日志，表明 Pod 存在于 backoffQ 中
 		klog.ErrorS(nil, "Error: pod is already in the podBackoff queue", "pod", klog.KObj(pod))
+		// Delete 已经将 Pod 从 backoffQ 中移除，无需额外操作
 	}
+
+	// 更新指标：记录一个 Pod 被添加到 activeQ (来源为 PodAdd)
 	metrics.SchedulerQueueIncomingPods.WithLabelValues("active", PodAdd).Inc()
+
+	// 将 Pod 添加到 PodNominator 中。
+	// PodNominator 用于记录 Pod 的提名节点 (nominated node)，用于处理抢占逻辑。
+	// 第二个参数 "" 表示没有特定的提名节点 (通常在 Add 时为空)。
 	p.PodNominator.AddNominatedPod(pInfo.PodInfo, "")
+
+	// 广播条件变量，通知等待在 p.cond 上的其他 Goroutine (例如调度循环)
+	// 队列状态已更新，可能有新的 Pod 可以被调度。
 	p.cond.Broadcast()
 
+	// 成功添加，返回 nil
 	return nil
 }
 
@@ -409,47 +449,91 @@ func (p *PriorityQueue) AddUnschedulableIfNotPresent(pInfo *framework.QueuedPodI
 	return nil
 }
 
-// flushBackoffQCompleted Moves all pods from backoffQ which have completed backoff in to activeQ
+// flushBackoffQCompleted 将 backoffQ 中已完成退避（backoff）时间的 Pod 移动到 activeQ。
+//
+// 在 Kubernetes 调度器中，当 Pod 因调度失败等原因被放入 backoffQ 时，
+// 会根据一定的策略计算一个退避时间。这个方法会周期性地检查 backoffQ 的队首，
+// 如果队首 Pod 的退避时间已过，则将其移回 activeQ 以供重新调度。
+// 该方法会持续处理队列，直到遇到一个尚未完成退避的 Pod 或队列为空。
 func (p *PriorityQueue) flushBackoffQCompleted() {
+	// 加锁以保证并发安全
 	p.lock.Lock()
 	defer p.lock.Unlock()
+
+	// 使用 for 循环持续处理队列，直到队列为空或遇到未完成退避的 Pod
 	for {
+		// 查看 backoffQ 的队首元素，但不移除它
+		// 这里使用 Peek 而不是 Pop 是为了先检查退避时间是否已过，避免不必要的 Pop 和后续的错误处理
 		rawPodInfo := p.podBackoffQ.Peek()
 		if rawPodInfo == nil {
+			// 如果队列为空，直接返回
 			return
 		}
+		// 断言类型并获取 Pod 对象
 		pod := rawPodInfo.(*framework.QueuedPodInfo).Pod
+		// 计算该 Pod 的退避结束时间
 		boTime := p.getBackoffTime(rawPodInfo.(*framework.QueuedPodInfo))
+
+		// 检查当前时间是否已经超过了该 Pod 的退避结束时间
 		if boTime.After(p.clock.Now()) {
+			// 如果退避时间未过，说明队列中后续的 Pod 也一定未过退避时间（因为队列是按时间排序的）
+			// 因此可以安全地退出循环
 			return
 		}
+
+		// 退避时间已过，从 backoffQ 中移除该 Pod
 		_, err := p.podBackoffQ.Pop()
 		if err != nil {
+			// 理论上不应该发生，因为 Peek 刚刚确认了元素存在
+			// 如果发生错误，记录日志并退出循环
 			klog.ErrorS(err, "Unable to pop pod from backoff queue despite backoff completion", "pod", klog.KObj(pod))
 			return
 		}
+
+		// 将已完成退避的 Pod 添加到 activeQ，使其可以被重新调度
 		p.activeQ.Add(rawPodInfo)
+
+		// 更新指标：记录一个 Pod 从 backoffQ 移动到 activeQ
 		metrics.SchedulerQueueIncomingPods.WithLabelValues("active", BackoffComplete).Inc()
+
+		// 注意：defer p.cond.Broadcast() 放在循环内部是不寻常的。
+		// 通常 p.cond.Broadcast() 会在所有 Pod 处理完毕后调用一次。
+		// 这里的写法意味着每处理一个 Pod 就广播一次，可能会带来性能开销。
+		// 这行代码的作用是通知等待在条件变量 p.cond 上的其他 Goroutine（例如调度循环）队列状态已更新。
 		defer p.cond.Broadcast()
 	}
 }
 
 // flushUnschedulableQLeftover moves pod which stays in unschedulableQ longer than the unschedulableQTimeInterval
 // to activeQ.
+// flushUnschedulableQLeftover 将在 unschedulableQ 中停留时间过长（超过 unschedulableQTimeInterval）的 Pod
+// 重新移回 activeQ 或 backoffQ，以便再次尝试调度。
+//
+// 这个方法通常在调度器的周期性清理逻辑中被调用，防止 Pod 长时间滞留在 unschedulableQ 中。
+// 例如，集群资源状况可能已发生变化（如节点扩容、其他 Pod 被删除），使得原本无法调度的 Pod 变得可调度。
 func (p *PriorityQueue) flushUnschedulableQLeftover() {
+	// 加锁以保证并发安全
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	var podsToMove []*framework.QueuedPodInfo
-	currentTime := p.clock.Now()
+	var podsToMove []*framework.QueuedPodInfo // 存储需要移动的 Pod 信息
+	currentTime := p.clock.Now()              // 获取当前时间
+
+	// 遍历 unschedulableQ 中的所有 Pod
 	for _, pInfo := range p.unschedulableQ.podInfoMap {
-		lastScheduleTime := pInfo.Timestamp
+		lastScheduleTime := pInfo.Timestamp // 获取 Pod 上次尝试调度的时间戳
+		// 计算当前时间与上次调度时间的差值
 		if currentTime.Sub(lastScheduleTime) > unschedulableQTimeInterval {
+			// 如果时间差超过了预设的阈值 (unschedulableQTimeInterval)
+			// 将该 Pod 加入待移动列表
 			podsToMove = append(podsToMove, pInfo)
 		}
 	}
 
+	// 如果有待移动的 Pod
 	if len(podsToMove) > 0 {
+		// 调用内部方法将这些 Pod 移回 activeQ 或 backoffQ
+		// 移动原因标记为 UnschedulableTimeout，表示因在 unschedulableQ 中超时而移动
 		p.movePodsToActiveOrBackoffQueue(podsToMove, UnschedulableTimeout)
 	}
 }

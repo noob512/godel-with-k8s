@@ -22,6 +22,11 @@ import (
 	"fmt"
 	"time"
 
+	//------------------------------------------------------------------
+	commoncache "github.com/kubewharf/godel-scheduler/pkg/common/cache"
+	godelcache "github.com/kubewharf/godel-scheduler/pkg/scheduler/cache"
+	//------------------------------------------------------------------
+
 	"github.com/google/go-cmp/cmp"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -91,45 +96,55 @@ type Configurator struct {
 	clusterEventMap map[framework.ClusterEvent]sets.String
 }
 
-// create a scheduler from a set of registered plugins.
-func (c *Configurator) create() (*Scheduler, error) {
-	var extenders []framework.Extender
-	var ignoredExtendedResources []string
+// create 方法根据 Configurator 中的配置（如插件、扩展器、配置集等）创建并初始化一个完整的 Scheduler 实例。
+// 它负责处理扩展器 (Extenders)、配置插件参数、创建调度队列、设置缓存调试器等。
+func (c *Configurator) create(godelSchedulerName string, schedulerName *string,stopEverything <-chan struct{}) (*Scheduler, error) {
+	var extenders []framework.Extender // 存储所有扩展器实例。
+	var ignoredExtendedResources []string // 存储扩展器管理的、应被调度器忽略的资源名称列表。
+
+	// 如果配置了扩展器。
 	if len(c.extenders) != 0 {
-		var ignorableExtenders []framework.Extender
+		klog.Info("确实使用了拓展组件因为len(c.extenders) != 0")
+		var ignorableExtenders []framework.Extender // 存储可忽略错误的扩展器。
+
+		// 遍历所有配置的扩展器定义。
 		for ii := range c.extenders {
 			klog.V(2).InfoS("Creating extender", "extender", c.extenders[ii])
+			// 根据配置创建 HTTP 扩展器实例。
 			extender, err := NewHTTPExtender(&c.extenders[ii])
 			if err != nil {
 				return nil, err
 			}
+
+			// 根据扩展器是否可忽略错误，将其添加到不同的列表。
 			if !extender.IsIgnorable() {
 				extenders = append(extenders, extender)
 			} else {
 				ignorableExtenders = append(ignorableExtenders, extender)
 			}
+
+			// 收集扩展器管理的、应被调度器忽略的资源。
 			for _, r := range c.extenders[ii].ManagedResources {
 				if r.IgnoredByScheduler {
 					ignoredExtendedResources = append(ignoredExtendedResources, r.Name)
 				}
 			}
 		}
-		// place ignorable extenders to the tail of extenders
+		// 将可忽略错误的扩展器追加到扩展器列表的末尾。
 		extenders = append(extenders, ignorableExtenders...)
 	}
 
-	// If there are any extended resources found from the Extenders, append them to the pluginConfig for each profile.
-	// This should only have an effect on ComponentConfig, where it is possible to configure Extenders and
-	// plugin args (and in which case the extender ignored resources take precedence).
-	// For earlier versions, using both policy and custom plugin config is disallowed, so this should be the only
-	// plugin config for this plugin.
+	// 如果从扩展器配置中找到了任何应被忽略的扩展资源。
 	if len(ignoredExtendedResources) > 0 {
+		klog.Info("从扩展器配置中找到了任何应被忽略的扩展资源")
+		// 遍历所有调度配置集。
 		for i := range c.profiles {
 			prof := &c.profiles[i]
 			var found = false
+			// 在当前配置集的插件配置中查找 NodeResourcesFit 插件。
 			for k := range prof.PluginConfig {
 				if prof.PluginConfig[k].Name == noderesources.FitName {
-					// Update the existing args
+					// 找到后，更新其参数，将扩展资源添加到忽略列表中。
 					pc := &prof.PluginConfig[k]
 					args, ok := pc.Args.(*schedulerapi.NodeResourcesFitArgs)
 					if !ok {
@@ -140,60 +155,92 @@ func (c *Configurator) create() (*Scheduler, error) {
 					break
 				}
 			}
+			// 如果在配置集中找不到 NodeResourcesFit 插件，则报错。
 			if !found {
 				return nil, fmt.Errorf("can't find NodeResourcesFitArgs in plugin config")
 			}
 		}
 	}
+	//-----------------------------------------------------------------------
+	// 从 Informer Factory 获取核心资源的 Lister 和 Informer
+	podLister := c.informerFactory.Core().V1().Pods().Lister()
+	podInformer := c.informerFactory.Core().V1().Pods()
 
-	// The nominator will be passed all the way to framework instantiation.
+	// 检查是否启用了抢占（preemption）功能
+	// mayHasPreemption := parseProfilesBoolConfiguration(options, profileNeedPreemption)
+
+	// 构建通用缓存（commonCache）的初始化参数包装器
+	handlerWrapper :=commoncache.MakeCacheHandlerWrapper().
+		ComponentName(godelSchedulerName).
+		SchedulerType(*schedulerName).
+		PodAssumedTTL(15 * time.Minute). // Pod 假定（assumed）状态的 TTL
+		Period(10 * time.Second).        // 缓存定期同步周期
+		StopCh(stopEverything).
+		PodLister(podLister).
+		PodInformer(podInformer)
+	//-----------------------------------------------------------------------
+
+	// 创建 Pod 提名器 (Pod Nominator)，用于处理抢占逻辑。
+	// 它需要 Pod 列表器 (Pod Lister) 来获取 Pod 信息。
 	nominator := internalqueue.NewPodNominator(c.informerFactory.Core().V1().Pods().Lister())
+
+	// 根据配置集定义、插件注册表、事件记录器等信息，创建并初始化所有调度配置集 (Profiles)。
+	// 每个 Profile 都是一个独立的调度框架实例。
 	profiles, err := profile.NewMap(c.profiles, c.registry, c.recorderFactory,
-		frameworkruntime.WithComponentConfigVersion(c.componentConfigVersion),
-		frameworkruntime.WithClientSet(c.client),
-		frameworkruntime.WithKubeConfig(c.kubeConfig),
-		frameworkruntime.WithInformerFactory(c.informerFactory),
-		frameworkruntime.WithSnapshotSharedLister(c.nodeInfoSnapshot),
-		frameworkruntime.WithRunAllFilters(c.alwaysCheckAllPredicates),
-		frameworkruntime.WithPodNominator(nominator),
-		frameworkruntime.WithCaptureProfile(frameworkruntime.CaptureProfile(c.frameworkCapturer)),
-		frameworkruntime.WithClusterEventMap(c.clusterEventMap),
-		frameworkruntime.WithParallelism(int(c.parallellism)),
-		frameworkruntime.WithExtenders(extenders),
+		frameworkruntime.WithComponentConfigVersion(c.componentConfigVersion), // 设置组件配置版本
+		frameworkruntime.WithClientSet(c.client),                             // 提供 Kubernetes 客户端
+		frameworkruntime.WithKubeConfig(c.kubeConfig),                        // 提供 KubeConfig
+		frameworkruntime.WithInformerFactory(c.informerFactory),              // 提供 Informer 工厂
+		frameworkruntime.WithSnapshotSharedLister(c.nodeInfoSnapshot),        // 提供节点信息快照列表器
+		frameworkruntime.WithRunAllFilters(c.alwaysCheckAllPredicates),       // 设置是否总是运行所有过滤器
+		frameworkruntime.WithPodNominator(nominator),                         // 提供提名器
+		frameworkruntime.WithCaptureProfile(frameworkruntime.CaptureProfile(c.frameworkCapturer)), // 设置框架捕获器
+		frameworkruntime.WithClusterEventMap(c.clusterEventMap),              // 提供集群事件映射
+		frameworkruntime.WithParallelism(int(c.parallellism)),                // 设置并行度
+		frameworkruntime.WithExtenders(extenders),                            // 提供扩展器列表
 	)
 	if err != nil {
 		return nil, fmt.Errorf("initializing profiles: %v", err)
 	}
+	// 确保至少创建了一个配置集。
 	if len(profiles) == 0 {
 		return nil, errors.New("at least one profile is required")
 	}
-	// Profiles are required to have equivalent queue sort plugins.
+
+	// 获取第一个配置集的队列排序函数 (QueueSort plugin)。
+	// 所有配置集必须使用相同的队列排序插件。
 	lessFn := profiles[c.profiles[0].SchedulerName].QueueSortFunc()
+	// 创建调度队列 (SchedulingQueue)，用于存放等待调度的 Pod。
+	// 队列的排序由 lessFn 决定，并配置了回退时间、提名器等。
 	podQueue := internalqueue.NewSchedulingQueue(
 		lessFn,
 		c.informerFactory,
-		internalqueue.WithPodInitialBackoffDuration(time.Duration(c.podInitialBackoffSeconds)*time.Second),
-		internalqueue.WithPodMaxBackoffDuration(time.Duration(c.podMaxBackoffSeconds)*time.Second),
-		internalqueue.WithPodNominator(nominator),
-		internalqueue.WithClusterEventMap(c.clusterEventMap),
+		internalqueue.WithPodInitialBackoffDuration(time.Duration(c.podInitialBackoffSeconds)*time.Second), // 初始回退时间
+		internalqueue.WithPodMaxBackoffDuration(time.Duration(c.podMaxBackoffSeconds)*time.Second),       // 最大回退时间
+		internalqueue.WithPodNominator(nominator),                                                         // 提名器
+		internalqueue.WithClusterEventMap(c.clusterEventMap),                                            // 集群事件映射
 	)
 
-	// Setup cache debugger.
+	// 创建缓存调试器 (Cache Debugger)，用于监控和调试调度器内部缓存的状态。
 	debugger := cachedebugger.New(
-		c.informerFactory.Core().V1().Nodes().Lister(),
-		c.informerFactory.Core().V1().Pods().Lister(),
-		c.schedulerCache,
-		podQueue,
+		c.informerFactory.Core().V1().Nodes().Lister(), // 节点列表器
+		c.informerFactory.Core().V1().Pods().Lister(),  // Pod 列表器
+		c.schedulerCache,                               // 调度器缓存
+		podQueue,                                      // 调度队列
 	)
+	// 启动调试器监听信号，以便在接收到特定信号时打印缓存信息。
 	debugger.ListenForSignal(c.StopEverything)
 
+	// 创建通用调度算法 (GenericScheduler)，它是调度决策的核心逻辑。
 	algo := NewGenericScheduler(
-		c.schedulerCache,
-		c.nodeInfoSnapshot,
-		c.percentageOfNodesToScore,
+		c.schedulerCache,                    // 调度器缓存
+		c.nodeInfoSnapshot,                  // 节点信息快照
+		c.percentageOfNodesToScore,          // 评分节点的百分比阈值
 	)
-
-	return &Scheduler{
+	scheduler := &Scheduler{
+		Name:            godelSchedulerName,
+		SchedulerName: 	 schedulerName,
+		commonCache: godelcache.New(handlerWrapper.Obj()),
 		SchedulerCache:  c.schedulerCache,
 		Algorithm:       algo,
 		Extenders:       extenders,
@@ -202,7 +249,10 @@ func (c *Configurator) create() (*Scheduler, error) {
 		Error:           MakeDefaultErrorFunc(c.client, c.informerFactory.Core().V1().Pods().Lister(), podQueue, c.schedulerCache),
 		StopEverything:  c.StopEverything,
 		SchedulingQueue: podQueue,
-	}, nil
+	}
+
+	// 创建并返回最终的 Scheduler 实例。
+	return scheduler, nil
 }
 
 // createFromPolicy creates a scheduler from the legacy policy file.
@@ -312,7 +362,10 @@ func (c *Configurator) createFromPolicy(policy schedulerapi.Policy) (*Scheduler,
 		return nil, err
 	}
 
-	return c.create()
+	//---------------------------------------
+	//这里是一处修改，因为大概率用不上，所以直接返回nil,nil了
+	//原先是return c.create()
+	return nil,nil
 }
 
 func defaultPluginConfigArgs(prof *schedulerapi.KubeSchedulerProfile) error {

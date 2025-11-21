@@ -18,6 +18,10 @@ package scheduler
 
 import (
 	"fmt"
+	//-----------------------------------------------------------------------------
+	crdinformers "github.com/kubewharf/godel-scheduler-api/pkg/client/informers/externalversions"
+	schedulingv1a1 "github.com/kubewharf/godel-scheduler-api/pkg/apis/scheduling/v1alpha1"
+	//------------------------------------------------------------------------------
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/klog/v2"
 	"reflect"
@@ -115,12 +119,26 @@ func (sched *Scheduler) deleteNodeFromCache(obj interface{}) {
 	}
 }
 
+// addPodToSchedulingQueue 是一个事件处理函数，用于响应 Pod 的 "Add" 事件。
+// 当一个未调度的 Pod 被创建或被当前调度器选中负责调度时，此函数会被调用。
+// 它的主要作用是将新创建的 Pod 添加到调度器的调度队列中，等待后续的调度流程处理。
 func (sched *Scheduler) addPodToSchedulingQueue(obj interface{}) {
+	// 将传入的 interface{} 对象断言为 *v1.Pod 类型。
+	// 这个 obj 通常来自于 Pod Informer 的 Add 事件。
 	pod := obj.(*v1.Pod)
+
+	// 记录一条日志，表明有一个未调度的 Pod 被添加到了调度队列。
+	// 日志级别为 V(3)，属于较详细的调试信息。
 	klog.V(3).InfoS("Add event for unscheduled pod", "pod", klog.KObj(pod))
+
+	// 调用调度队列的 Add 方法，将 Pod 添加到队列中。
+	// 这通常意味着 Pod 会被放入 activeQ，使其进入可调度的候选列表。
 	if err := sched.SchedulingQueue.Add(pod); err != nil {
+		// 如果添加到队列失败，记录错误日志。
+		// 这可能是因为队列已满、Pod 本身存在格式错误等。
 		utilruntime.HandleError(fmt.Errorf("unable to queue %T: %v", obj, err))
 	}
+	// 如果添加成功，函数静默返回，Pod 已在队列中等待调度。
 }
 
 func (sched *Scheduler) updatePodInSchedulingQueue(oldObj, newObj interface{}) {
@@ -261,25 +279,36 @@ func responsibleForPod(pod *v1.Pod, profiles profile.Map) bool {
 	return profiles.HandlesSchedulerName(pod.Spec.SchedulerName)
 }
 
-// addAllEventHandlers is a helper function used in tests and in Scheduler
-// to add event handlers for various informers.
+// addAllEventHandlers 是一个辅助函数，用于在测试和调度器主流程中，
+// 为各种 Kubernetes 资源的 Informer 添加事件处理函数。
+// 这些处理函数负责监听资源变化（如 Pod、Node 等的增删改），并相应地更新调度器的内部缓存和调度队列。
+//
+// 参数说明：
+// - sched: 指向调度器实例的指针，处理函数会调用其方法来更新状态。
+// - informerFactory: 共享的 Informer 工厂，用于获取标准 Kubernetes API 资源的 Informer。
+// - dynInformerFactory: 动态共享 Informer 工厂，用于获取 CRD 等自定义资源的 Informer。
+// - gvkMap: 一个映射，定义了哪些 GVK (GroupVersionKind) 资源需要监听以及需要监听的动作类型 (Add, Update, Delete)。
 func addAllEventHandlers(
 	sched *Scheduler,
 	informerFactory informers.SharedInformerFactory,
 	dynInformerFactory dynamicinformer.DynamicSharedInformerFactory,
+	crdInformerFactory crdinformers.SharedInformerFactory,
 	gvkMap map[framework.GVK]framework.ActionType,
 ) {
-	// scheduled pod cache
+	// --- 1. 为已调度的 Pod 添加事件处理器 ---
+	// 监听 Pod 变化，仅处理已分配节点的 Pod (assignedPod)。
+	// 这些事件会更新调度器的 Pod 缓存 (pod cache)，用于快速查询已调度 Pod 的状态。
 	informerFactory.Core().V1().Pods().Informer().AddEventHandler(
 		cache.FilteringResourceEventHandler{
 			FilterFunc: func(obj interface{}) bool {
 				switch t := obj.(type) {
 				case *v1.Pod:
+					// 仅处理已分配节点的 Pod
 					return assignedPod(t)
 				case cache.DeletedFinalStateUnknown:
+					// 处理被删除的 Pod，即使其最终状态未知。
+					// 由于对象可能已过期，不检查其是否已分配，直接尝试清理。
 					if _, ok := t.Obj.(*v1.Pod); ok {
-						// The carried object may be stale, so we don't use it to check if
-						// it's assigned or not. Attempting to cleanup anyways.
 						return true
 					}
 					utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, sched))
@@ -290,23 +319,27 @@ func addAllEventHandlers(
 				}
 			},
 			Handler: cache.ResourceEventHandlerFuncs{
-				AddFunc:    sched.addPodToCache,
-				UpdateFunc: sched.updatePodInCache,
-				DeleteFunc: sched.deletePodFromCache,
+				AddFunc:    sched.addPodToCache,      // Pod 添加时，将其加入缓存
+				UpdateFunc: sched.updatePodInCache,   // Pod 更新时，更新缓存中的记录
+				DeleteFunc: sched.deletePodFromCache, // Pod 删除时，从缓存中移除
 			},
 		},
 	)
-	// unscheduled pod queue
+
+	// --- 2. 为未调度的 Pod 添加事件处理器 ---
+	// 监听 Pod 变化，仅处理未分配节点且当前调度器负责调度的 Pod。
+	// 这些事件会更新调度器的调度队列 (scheduling queue)。
 	informerFactory.Core().V1().Pods().Informer().AddEventHandler(
 		cache.FilteringResourceEventHandler{
 			FilterFunc: func(obj interface{}) bool {
 				switch t := obj.(type) {
 				case *v1.Pod:
+					// 仅处理未分配节点且当前调度器配置 (Profiles) 负责调度的 Pod
 					return !assignedPod(t) && responsibleForPod(t, sched.Profiles)
 				case cache.DeletedFinalStateUnknown:
+					// 处理被删除的 Pod，检查其是否是当前调度器负责的未调度 Pod。
+					// 由于对象可能已过期，不检查其是否已分配，只检查负责关系。
 					if pod, ok := t.Obj.(*v1.Pod); ok {
-						// The carried object may be stale, so we don't use it to check if
-						// it's assigned or not.
 						return responsibleForPod(pod, sched.Profiles)
 					}
 					utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, sched))
@@ -317,20 +350,56 @@ func addAllEventHandlers(
 				}
 			},
 			Handler: cache.ResourceEventHandlerFuncs{
-				AddFunc:    sched.addPodToSchedulingQueue,
-				UpdateFunc: sched.updatePodInSchedulingQueue,
-				DeleteFunc: sched.deletePodFromSchedulingQueue,
+				AddFunc:    sched.addPodToSchedulingQueue,      // Pod 添加时，将其加入调度队列
+				UpdateFunc: sched.updatePodInSchedulingQueue,   // Pod 更新时，更新调度队列中的记录
+				DeleteFunc: sched.deletePodFromSchedulingQueue, // Pod 删除时，从调度队列中移除
 			},
 		},
 	)
 
+	// --- 3. 为 Node 添加事件处理器 ---
+	// 监听 Node 变化，无论 Pod 是否已分配，Node 的变化都可能影响调度决策。
+	// 这些事件会更新调度器的 Node 缓存 (node cache)。
 	informerFactory.Core().V1().Nodes().Informer().AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
-			AddFunc:    sched.addNodeToCache,
-			UpdateFunc: sched.updateNodeInCache,
-			DeleteFunc: sched.deleteNodeFromCache,
+			AddFunc:    sched.addNodeToCache,      // Node 添加时，将其加入缓存
+			UpdateFunc: sched.updateNodeInCache,   // Node 更新时，更新缓存中的记录
+			DeleteFunc: sched.deleteNodeFromCache, // Node 删除时，从缓存中移除
 		},
 	)
+
+	//-------------------------------------------------------------------------
+	// ==================== Scheduler CRD 事件处理器 ====================
+	// 监听 Godel Scheduler 自身配置的变更（如调度策略更新）
+	crdInformerFactory.Scheduling().V1alpha1().Schedulers().Informer().AddEventHandler(
+		// 使用 FilteringResourceEventHandler 只处理与当前调度器实例相关的事件
+		cache.FilteringResourceEventHandler{
+			FilterFunc: func(obj interface{}) bool {
+				switch t := obj.(type) {
+				case *schedulingv1a1.Scheduler:
+					// 添加日志打印 Scheduler CRD 的名称和当前调度器的名称
+					klog.InfoS("比较调度器名称", "schedulerCRDName", t.Name, "currentSchedulerName", sched.Name)
+					return t.Name == sched.Name // 只处理名称匹配的 Scheduler CRD
+				case cache.DeletedFinalStateUnknown:
+					// 处理删除事件中缓存可能不一致的情况
+					if scheduler, ok := t.Obj.(*schedulingv1a1.Scheduler); ok {
+						// 添加日志打印 DeletedFinalStateUnknown 中的 Scheduler 名称和当前调度器的名称
+						klog.InfoS("比较调度器名称", "schedulerCRDName", scheduler.Name, "currentSchedulerName", sched.Name)
+						return scheduler.Name == sched.Name
+					}
+					utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1alpha1.Scheduler in %T", obj, sched))
+					return false
+				default:
+					utilruntime.HandleError(fmt.Errorf("unable to handle object in %T: %T", sched, obj))
+					return false
+				}
+			},
+			Handler: cache.ResourceEventHandlerFuncs{
+				UpdateFunc: sched.onSchedulerUpdate, // Scheduler CRD 更新时触发配置重载
+			},
+		},
+	)
+	//-----------------------------------------------------------------------------------------------
 
 	//buildEvtResHandler := func(at framework.ActionType, gvk framework.GVK, shortGVK string) cache.ResourceEventHandlerFuncs {
 	//	funcs := cache.ResourceEventHandlerFuncs{}

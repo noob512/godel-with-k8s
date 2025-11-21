@@ -225,6 +225,9 @@ func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *
 	// 以确保调度器拥有最新的数据。
 	cc.InformerFactory.WaitForCacheSync(ctx.Done())
 
+	cc.GodelCrdInformerFactory.Start(ctx.Done())
+	cc.GodelCrdInformerFactory.WaitForCacheSync(ctx.Done())
+
 	// 启动调度器循环。
 	sched.Run(ctx)
 	// 此返回语句在正常情况下（如果 sched.Run 是阻塞调用）不应该被达到。
@@ -357,7 +360,12 @@ func Setup(ctx context.Context, opts *options.Options, outOfTreeRegistryOptions 
 	completedProfiles := make([]kubeschedulerconfig.KubeSchedulerProfile, 0)
 	// 创建调度器实例。
 	// 传入客户端、Informer 工厂、事件记录器工厂、停止信号通道以及各种配置选项。
-	sched, err := scheduler.New(cc.Client,
+	sched, err := scheduler.New(
+		cc.GodelComponentConfig.GodelSchedulerName,
+		cc.GodelComponentConfig.SchedulerName,
+		cc.GodelCrdClient,
+		cc.GodelCrdInformerFactory,
+		cc.Client,
 		cc.InformerFactory,
 		recorderFactory,
 		ctx.Done(),
