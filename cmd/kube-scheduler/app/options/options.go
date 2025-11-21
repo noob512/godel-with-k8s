@@ -22,6 +22,9 @@ import (
 	"os"
 	"strconv"
 	"time"
+	//--------------------------------------
+	godelschedulerconfig "github.com/kubewharf/godel-scheduler/pkg/scheduler/apis/config"
+	//-------------------------------------
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -48,6 +51,23 @@ import (
 
 // Options has all the params needed to run a Scheduler
 type Options struct {
+	//------------------------------------------------------
+	// ComponentConfig 存储了 Godel 调度器的核心配置，其默认值可以被 ConfigFile 或 InsecureServing 中的值覆盖。
+	GodelComponentConfig godelschedulerconfig.GodelSchedulerConfiguration
+	// SchedulerRenewIntervalSeconds 定义调度器在领导者选举机制中的租约续期间隔（以秒为单位）。
+	// 这与 LeaderElectionConfiguration 中的 RetryPeriod 相关。
+	SchedulerRenewIntervalSeconds int64
+	// 以下字段是为了向后兼容而保留的，计划在未来版本中移除。
+	// UnitMaxBackoffSeconds 指定调度器在处理失败时的最大退避时间（秒）。
+	UnitMaxBackoffSeconds int64
+	// UnitInitialBackoffSeconds 指定调度器在处理失败时的初始退避时间（秒）。
+	UnitInitialBackoffSeconds int64
+	// DisablePreemption 控制是否禁用调度器的抢占（Preemption）功能。
+	// 如果为 true，则调度器不会尝试驱逐低优先级 Pod 来为高优先级 Pod 腾出空间。
+	DisablePreemption bool
+	// AttemptImpactFactorOnPriority 是一个影响优先级计算的因子，用于在调度决策中考虑潜在的抢占影响。
+	AttemptImpactFactorOnPriority float64
+	//------------------------------------------------------------
 	// The default values. These are overridden if ConfigFile is set or by values in InsecureServing.
 	ComponentConfig *kubeschedulerconfig.KubeSchedulerConfiguration
 
