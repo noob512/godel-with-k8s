@@ -96,6 +96,7 @@ type Options struct {
 // 该函数初始化并返回一个包含默认配置的 Options 结构体指针，
 // 用于配置 Kubernetes 调度器的各个方面，如安全服务、认证、授权、领导者选举等。
 func NewOptions() *Options {
+	klog.Info("first-change")
 	o := &Options{
 		// SecureServing: 配置安全（HTTPS）服务选项，并设置为使用本地回环地址。
 		SecureServing: apiserveroptions.NewSecureServingOptions().WithLoopback(),
